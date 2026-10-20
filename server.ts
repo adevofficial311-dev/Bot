@@ -1136,11 +1136,10 @@ export async function createServer() {
   return app;
 }
 
-if (process.env.NODE_ENV !== 'production' || process.argv[1] === fileURLToPath(import.meta.url)) {
-  createServer().then((app) => {
-    const port = 3000;
-    app.listen(port, '0.0.0.0', () => {
-      console.log(`Server running on http://localhost:${port}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`🚀 Web server listening on port ${PORT}`);
+  await startBot();
     });
   });
 }
