@@ -247,17 +247,18 @@ export async function createServer() {
   const app = express();
   app.use(express.json());
 
-  app.get('/api/download/vercel-zip', async (req, res) => {
+  app.get(['/api/download/vercel-zip', '/api/download/render-zip'], async (req, res) => {
     try {
       const zip = new JSZip();
       const rootDir = process.cwd();
 
-      // Complete manifest of files for full Vercel Vite + Serverless deployment
       const filesToInclude = [
         'package.json',
         'tsconfig.json',
         'vite.config.ts',
         'vercel.json',
+        'render.yaml',
+        'README-RENDER.md',
         '.vercelignore',
         '.npmrc',
         'index.html',
@@ -265,8 +266,6 @@ export async function createServer() {
         'bot.ts',
         'firebase-applet-config.json',
         'firestore.rules',
-        'render.yaml',
-        'README-RENDER.md',
         'api/index.ts',
         'api/[...all].ts',
         'api/bot/status.ts',
@@ -286,18 +285,18 @@ export async function createServer() {
         }
       }
 
-      const readmePath = resolve(rootDir, 'README-VERCEL.md');
+      const readmePath = resolve(rootDir, 'README-RENDER.md');
       if (fs.existsSync(readmePath)) {
         zip.file('README.md', fs.readFileSync(readmePath));
       }
 
       const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
       res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="yama-discord-bot-vercel.zip"');
+      res.setHeader('Content-Disposition', 'attachment; filename="yama-discord-bot-render.zip"');
       res.setHeader('Content-Length', zipBuffer.length);
       res.send(zipBuffer);
     } catch (err: any) {
-      console.error('Error generating Vercel ZIP:', err);
+      console.error('Error generating Render ZIP:', err);
       res.status(500).json({ error: 'Failed to generate ZIP package: ' + (err?.message || err) });
     }
   });
