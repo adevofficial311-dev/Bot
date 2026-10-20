@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Client, GatewayIntentBits, EmbedBuilder, ActivityType, PermissionsBitField, TextChannel } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, ActivityType, PermissionsBitField, TextChannel, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, getDoc } from 'firebase/firestore';
 import fs from 'fs';
@@ -144,6 +144,391 @@ client.on('messageDelete', async (delMsg) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────
+// AI STAFF ACTIONS
+// The AI only picks the action type + details. Targets (users / roles /
+// channels) are resolved by CODE from real mentions or the replied-to
+// message, so the AI can never invent or swap a target.
+// ─────────────────────────────────────────────────────────────
+const MAIN_STAFF_ID = '1521870728079737053'; // pinged (with the server owner) when a bulk action is refused
+const STAFF_ACTION_GATE = /\b(ban|unban|kick|mute|unmute|timeout|time out|warn|strike|role|colou?r|channel|rename|nickname|nick|create|make|delete|remove|give|assign)\b/i;
+const DESTRUCTIVE = '(?:delete|remove|ban|kick|purge|wipe|nuke|clear|mute|timeout|destroy|kill)';
+const BULK_A = new RegExp(`\\b${DESTRUCTIVE}\\b\\s+(?:\\S+\\s+){0,2}(?:(?:all|every|everyone|everybody|everything|each|entire|whole)\\b|@everyone|@here)`, 'i');
+const BULK_B = /\b(nuke|wipe|purge|mass[\s-]?\w+|bulk)\b/i;
+const CONFIRM_ACTIONS = new Set(['ban', 'unban', 'kick', 'delete_channel', 'delete_role']);
+const DANGEROUS_ROLE_PERMS = [
+  PermissionsBitField.Flags.Administrator,
+  PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.ManageRoles,
+  PermissionsBitField.Flags.ManageChannels,
+  PermissionsBitField.Flags.BanMembers,
+  PermissionsBitField.Flags.KickMembers,
+  PermissionsBitField.Flags.ModerateMembers,
+  PermissionsBitField.Flags.ManageMessages,
+  PermissionsBitField.Flags.ManageWebhooks,
+  PermissionsBitField.Flags.MentionEveryone
+];
+const ALLOWED_ACTIONS = new Set([
+  'ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname',
+  'create_role', 'edit_role', 'give_role', 'remove_role', 'delete_role',
+  'create_channel', 'rename_channel', 'delete_channel'
+]);
+
+function isBulkRequest(text: string): boolean {
+  return BULK_A.test(text) || BULK_B.test(text);
+}
+
+async function refuseBulk(message: any, text: string) {
+  const ownerId = message.guild.ownerId;
+  const ping = [`<@${MAIN_STAFF_ID}>`, ownerId !== MAIN_STAFF_ID ? `<@${ownerId}>` : ''].filter(Boolean).join(' ');
+  const quoted = text.replace(/`/g, "'").substring(0, 200);
+  await message.reply({
+    content: `🚫 ${ping} — <@${message.author.id}> asked me for a **bulk / mass action**. I don't do those, so **nothing was changed**.\nRequest: \`${quoted}\``,
+    allowedMentions: { parse: [], users: [MAIN_STAFF_ID, ownerId] }
+  }).catch(() => {});
+}
+
+async function parseStaffIntent(maskedText: string): Promise<any | null> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+  const system = `You convert a Discord staff message into ONE JSON command. Output ONLY raw JSON, no markdown.
+Schema: {"intent":"action"|"none","action":string|null,"reason":string|null,"duration":string|null,"role_name":string|null,"color":string|null,"new_name":string|null,"channel_name":string|null,"multiple_actions":boolean,"bulk":boolean}
+Allowed actions: ban, unban, kick, mute, unmute, warn, set_nickname, create_role, edit_role, give_role, remove_role, delete_role, create_channel, rename_channel, delete_channel.
+Rules:
+- [USER], [ROLE], [CHANNEL] are placeholders for mentioned things. Never output IDs or invent targets.
+- intent="none" for casual chat, questions, or anything that is not a server command.
+- mute = timeout. duration like "10m", "1h", "2d" (null if not given).
+- color must be a #RRGGBB hex (convert color names to hex).
+- role_name = the existing/new role's name if given in words. channel_name likewise. new_name = new name / nickname.
+- reason = the reason if given, else null.
+- multiple_actions=true if the staff asked for more than one different action.
+- bulk=true if the request affects all/many/everyone/everything (all channels, all roles, all messages, all members, etc).`;
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'poolside/laguna-s-2.1',
+        temperature: 0,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: maskedText }]
+      })
+    });
+    const data: any = await res.json();
+    const raw: string = data?.choices?.[0]?.message?.content || '';
+    const m = raw.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function confirmWithStaff(message: any, text: string): Promise<boolean> {
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('ai_confirm').setLabel('Confirm').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('ai_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+  );
+  const prompt: any = await message.reply({ content: text, components: [row], allowedMentions: { parse: [] } }).catch(() => null);
+  if (!prompt) return false;
+  try {
+    const i: any = await prompt.awaitMessageComponent({
+      componentType: ComponentType.Button,
+      time: 30000,
+      filter: (x: any) => x.user.id === message.author.id
+    });
+    const ok = i.customId === 'ai_confirm';
+    await i.update({ content: ok ? `${text}\n\n✅ Confirmed.` : `${text}\n\n❎ Cancelled. Nothing was changed.`, components: [] }).catch(() => {});
+    return ok;
+  } catch (e) {
+    await prompt.edit({ content: `${text}\n\n⌛ Timed out. Nothing was changed.`, components: [] }).catch(() => {});
+    return false;
+  }
+}
+
+// Returns true if the message was handled (so normal AI chat is skipped).
+async function handleStaffAiAction(
+  message: any,
+  ctx: { isStaff: (id: string, member: any) => boolean; embedTitle: string; gifUrl: string; dmLogChannelId: string }
+): Promise<boolean> {
+  const guild = message.guild;
+  const text: string = message.content;
+  const reply = (content: string) => message.reply({ content, allowedMentions: { parse: [] } }).catch(() => {});
+
+  // Layer 1: bulk wording is refused before the AI is even asked.
+  if (isBulkRequest(text)) { await refuseBulk(message, text); return true; }
+
+  // Resolve exact targets from real mentions (never from the AI).
+  const botId = client.user!.id;
+  const userIds = [...new Set([...text.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].filter(id => id !== botId && id !== message.author.id);
+  const roleIds = [...new Set([...text.matchAll(/<@&(\d+)>/g)].map(m => m[1]))];
+  const channelIds = [...new Set([...text.matchAll(/<#(\d+)>/g)].map(m => m[1]))];
+
+  let repliedAuthorId: string | null = null;
+  if (userIds.length === 0 && message.reference?.messageId) {
+    try {
+      const replied = await message.channel.messages.fetch(message.reference.messageId);
+      if (!replied.author.bot) repliedAuthorId = replied.author.id;
+    } catch (e) {}
+  }
+  const targetIds = userIds.length > 0 ? userIds : (repliedAuthorId ? [repliedAuthorId] : []);
+
+  const masked = text
+    .replace(/<@!?\d+>/g, '[USER]')
+    .replace(/<@&\d+>/g, '[ROLE]')
+    .replace(/<#\d+>/g, '[CHANNEL]')
+    .trim();
+  const intent = await parseStaffIntent(masked);
+  if (!intent || intent.intent !== 'action' || !intent.action) return false; // normal chat
+
+  const action = String(intent.action);
+  if (!ALLOWED_ACTIONS.has(action)) {
+    await reply(`⚠️ I can't do \`${action.substring(0, 40)}\`. Nothing was changed.`);
+    return true;
+  }
+
+  // Layer 2: the AI's own bulk / multi-action flags.
+  if (intent.bulk === true) { await refuseBulk(message, text); return true; }
+  if (intent.multiple_actions === true) {
+    await reply('⚠️ One action at a time please. Nothing was changed.');
+    return true;
+  }
+
+  const reason = String(intent.reason || 'No reason provided').substring(0, 400);
+  const auditReason = `${message.author.tag} (via AI): ${reason}`.substring(0, 480);
+
+  // ── Member actions ──
+  const memberActions = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname', 'give_role', 'remove_role']);
+  let target: any = null;
+
+  if (memberActions.has(action)) {
+    // Layer 3: more than one target = bulk.
+    if (targetIds.length > 1) { await refuseBulk(message, text); return true; }
+
+    if (action === 'unban') {
+      const idMatch = text.match(/\b(\d{17,20})\b/);
+      if (!idMatch) { await reply('⚠️ To unban, give me the exact user ID. Nothing was changed.'); return true; }
+      const id = idMatch[1];
+      const ok = await confirmWithStaff(message, `⚠️ Unban user ID \`${id}\`?\nReason: ${reason}`);
+      if (!ok) return true;
+      try {
+        await guild.members.unban(id, auditReason);
+        await reply(`✅ Unbanned user ID \`${id}\`.`);
+      } catch (e: any) { await reply(`❌ Couldn't unban: ${e.message}`); }
+      return true;
+    }
+
+    if (targetIds.length === 0) {
+      await reply('⚠️ Who? Mention the user (or reply to their message and mention me). Nothing was changed.');
+      return true;
+    }
+    const targetId = targetIds[0];
+
+    // ban works even if they left; everything else needs them in the server
+    try { target = await guild.members.fetch(targetId); } catch (e) { target = null; }
+    if (!target && action !== 'ban') { await reply('⚠️ That user is not in this server. Nothing was changed.'); return true; }
+
+    // Safety: never touch the bot, the owner, staff or yourself.
+    if (targetId === botId || targetId === guild.ownerId || ctx.isStaff(targetId, target)) {
+      await reply('🛡️ I won\'t do that to the owner, the bot, or staff. Nothing was changed.');
+      return true;
+    }
+  }
+
+  const label = target ? `${target.user.tag} (\`${target.id}\`)` : `ID \`${targetIds[0]}\``;
+
+  if (CONFIRM_ACTIONS.has(action) && action !== 'unban' && action !== 'delete_channel' && action !== 'delete_role') {
+    const ok = await confirmWithStaff(message, `⚠️ **${action.toUpperCase()}** → ${label}\nReason: ${reason}\n\nThis is the exact user. Confirm?`);
+    if (!ok) return true;
+  }
+
+  try {
+    switch (action) {
+      case 'ban': {
+        if (target && !target.bannable) { await reply('❌ I can\'t ban them (their role is above mine or equal). Nothing was changed.'); return true; }
+        // deleteMessageSeconds: 0 → banning never wipes their message history
+        await guild.members.ban(targetIds[0], { reason: auditReason, deleteMessageSeconds: 0 });
+        await reply(`🔨 Banned ${label}.\nReason: ${reason}`);
+        return true;
+      }
+      case 'kick': {
+        if (!target.kickable) { await reply('❌ I can\'t kick them (their role is above mine or equal). Nothing was changed.'); return true; }
+        await target.kick(auditReason);
+        await reply(`👢 Kicked ${label}.\nReason: ${reason}`);
+        return true;
+      }
+      case 'mute': {
+        if (!target.moderatable) { await reply('❌ I can\'t mute them (role hierarchy). Nothing was changed.'); return true; }
+        let duration = String(intent.duration || '1h');
+        let m = duration.match(/^(\d+)([smhd])$/i);
+        if (!m) { duration = '1h'; m = duration.match(/^(\d+)([smhd])$/i); }
+        const v = parseInt(m![1], 10);
+        const unit = m![2].toLowerCase();
+        let ms = unit === 's' ? v * 1000 : unit === 'm' ? v * 60000 : unit === 'h' ? v * 3600000 : v * 86400000;
+        const max = 28 * 86400000;
+        if (ms > max) { ms = max; duration = '28d'; }
+        if (ms < 1000) { ms = 60000; duration = '1m'; }
+        await target.timeout(ms, auditReason);
+        await reply(`🔇 Muted ${label} for **${duration}**.\nReason: ${reason}`);
+        return true;
+      }
+      case 'unmute': {
+        if (!target.moderatable) { await reply('❌ I can\'t change their timeout (role hierarchy). Nothing was changed.'); return true; }
+        await target.timeout(null, auditReason);
+        await reply(`🔊 Unmuted ${label}.`);
+        return true;
+      }
+      case 'warn': {
+        const embed = new EmbedBuilder()
+          .setTitle(ctx.embedTitle)
+          .setColor(0xF59E0B)
+          .addFields(
+            { name: '👤 Target', value: `<@${target.id}> (${target.user.tag})`, inline: true },
+            { name: '🛡️ Action', value: 'Warn / Strike', inline: true },
+            { name: '👮 Issued By', value: `<@${message.author.id}>`, inline: true },
+            { name: '📝 Reason', value: reason, inline: false }
+          )
+          .setImage(ctx.gifUrl)
+          .setTimestamp();
+        await message.reply({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+        try {
+          const logChannel = await client.channels.fetch(ctx.dmLogChannelId);
+          if (logChannel && logChannel.isTextBased()) {
+            await (logChannel as TextChannel).send({
+              content: `📋 **[STRIKE LOG]** User <@${target.id}> warned by <@${message.author.id}> (via AI).\n**Reason:** ${reason}`,
+              embeds: [embed],
+              allowedMentions: { parse: [] }
+            });
+          }
+        } catch (e) {}
+        return true;
+      }
+      case 'set_nickname': {
+        if (!target.manageable) { await reply('❌ I can\'t change their nickname (role hierarchy). Nothing was changed.'); return true; }
+        const nick = intent.new_name ? String(intent.new_name).replace(/@/g, '').substring(0, 32) : null;
+        await target.setNickname(nick, auditReason);
+        await reply(nick ? `✏️ Set ${label}'s nickname to **${nick}**.` : `✏️ Reset ${label}'s nickname.`);
+        return true;
+      }
+    }
+
+    // ── Role / channel actions ──
+    const resolveRole = async (): Promise<any | null> => {
+      if (roleIds.length > 1 && action !== 'give_role') return 'many';
+      if (roleIds.length > 1) return 'many';
+      if (roleIds.length === 1) return guild.roles.cache.get(roleIds[0]) || (await guild.roles.fetch(roleIds[0]).catch(() => null));
+      if (intent.role_name) {
+        const nm = String(intent.role_name).toLowerCase();
+        const found = guild.roles.cache.filter((r: any) => r.name.toLowerCase() === nm && r.id !== guild.id);
+        if (found.size === 1) return found.first();
+        if (found.size > 1) return 'many';
+      }
+      return null;
+    };
+    const resolveChannel = async (): Promise<any | null> => {
+      if (channelIds.length > 1) return 'many';
+      if (channelIds.length === 1) return guild.channels.cache.get(channelIds[0]) || (await guild.channels.fetch(channelIds[0]).catch(() => null));
+      if (intent.channel_name) {
+        const nm = String(intent.channel_name).toLowerCase().replace(/^#/, '');
+        const found = guild.channels.cache.filter((c: any) => c.name.toLowerCase() === nm);
+        if (found.size === 1) return found.first();
+        if (found.size > 1) return 'many';
+      }
+      return null;
+    };
+    const cleanName = (n: string, channel = false) => {
+      let s = String(n || '').replace(/@/g, '').trim();
+      if (channel) s = s.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9\-_]/g, '');
+      return s.substring(0, 100);
+    };
+    const validColor = (c: any) => (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c.trim())) ? c.trim() : null;
+
+    switch (action) {
+      case 'create_role': {
+        const name = cleanName(intent.role_name || intent.new_name);
+        if (!name) { await reply('⚠️ What should the role be called? Nothing was changed.'); return true; }
+        const color = validColor(intent.color);
+        // Roles made by the AI never get any permissions.
+        const role = await guild.roles.create({ name, color: color || undefined, permissions: [], reason: auditReason });
+        await reply(`✅ Created role **${role.name}**${color ? ` with color \`${color}\`` : ''} (no permissions).`);
+        return true;
+      }
+      case 'edit_role': {
+        const role = await resolveRole();
+        if (role === 'many') { await reply('⚠️ More than one role matched. Mention the exact role. Nothing was changed.'); return true; }
+        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
+        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t edit that role. Nothing was changed.'); return true; }
+        const color = validColor(intent.color);
+        const newName = intent.new_name ? cleanName(intent.new_name) : null;
+        if (!color && !newName) { await reply('⚠️ Tell me the new color or name. Nothing was changed.'); return true; }
+        await role.edit({ ...(color ? { color } : {}), ...(newName ? { name: newName } : {}), reason: auditReason });
+        await reply(`✅ Updated role **${role.name}**${color ? ` → color \`${color}\`` : ''}${newName ? ` → name **${newName}**` : ''}.`);
+        return true;
+      }
+      case 'give_role':
+      case 'remove_role': {
+        const role = await resolveRole();
+        if (role === 'many') { await reply('⚠️ More than one role matched. Mention exactly one role. Nothing was changed.'); return true; }
+        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
+        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t manage that role. Nothing was changed.'); return true; }
+        if (DANGEROUS_ROLE_PERMS.some(p => role.permissions.has(p))) {
+          await reply('🛡️ That role has powerful permissions, so I won\'t hand it out or remove it. Nothing was changed.');
+          return true;
+        }
+        if (action === 'give_role') await target.roles.add(role, auditReason);
+        else await target.roles.remove(role, auditReason);
+        await reply(`✅ ${action === 'give_role' ? 'Gave' : 'Removed'} **${role.name}** ${action === 'give_role' ? 'to' : 'from'} ${label}.`);
+        return true;
+      }
+      case 'delete_role': {
+        const role = await resolveRole();
+        if (role === 'many') { await reply('⚠️ More than one role matched. Mention exactly one role. Nothing was changed.'); return true; }
+        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
+        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t delete that role. Nothing was changed.'); return true; }
+        if (ctx.isStaff('', { roles: { cache: { has: (id: string) => id === role.id } } })) {
+          await reply('🛡️ That is the staff role. Nothing was changed.');
+          return true;
+        }
+        const ok = await confirmWithStaff(message, `⚠️ **DELETE ROLE** → **${role.name}** (\`${role.id}\`)\nThis is the exact role. Confirm?`);
+        if (!ok) return true;
+        await role.delete(auditReason);
+        await reply(`🗑️ Deleted role **${role.name}**.`);
+        return true;
+      }
+      case 'create_channel': {
+        const name = cleanName(intent.channel_name || intent.new_name, true);
+        if (!name) { await reply('⚠️ What should the channel be called? Nothing was changed.'); return true; }
+        const ch = await guild.channels.create({ name, reason: auditReason });
+        await reply(`✅ Created channel <#${ch.id}>.`);
+        return true;
+      }
+      case 'rename_channel': {
+        const ch = await resolveChannel();
+        if (ch === 'many') { await reply('⚠️ More than one channel matched. Mention exactly one. Nothing was changed.'); return true; }
+        if (!ch) { await reply('⚠️ Which channel? Mention it. Nothing was changed.'); return true; }
+        const name = cleanName(intent.new_name, true);
+        if (!name) { await reply('⚠️ What\'s the new name? Nothing was changed.'); return true; }
+        const old = ch.name;
+        await ch.setName(name, auditReason);
+        await reply(`✏️ Renamed \`#${old}\` → <#${ch.id}>.`);
+        return true;
+      }
+      case 'delete_channel': {
+        const ch = await resolveChannel();
+        if (ch === 'many') { await reply('⚠️ More than one channel matched. Mention exactly one. Nothing was changed.'); return true; }
+        if (!ch) { await reply('⚠️ Which channel? Mention it. Nothing was changed.'); return true; }
+        const ok = await confirmWithStaff(message, `⚠️ **DELETE CHANNEL** → #${ch.name} (\`${ch.id}\`)\nThis is the exact channel. Confirm?`);
+        if (!ok) return true;
+        await ch.delete(auditReason);
+        if (ch.id !== message.channel.id) await reply(`🗑️ Deleted channel #${ch.name}.`);
+        return true;
+      }
+    }
+  } catch (err: any) {
+    await reply(`❌ That failed: ${err.message}. Nothing else was changed.`);
+    return true;
+  }
+  return false;
+}
+
 // Message create handler
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -192,6 +577,15 @@ client.on('messageCreate', async (message) => {
   const isCommand = message.content.startsWith(prefix) || trimmed === 'y!help' || trimmed === '!help';
 
   if (!isCommand && (isBotMention || isReplyToBot)) {
+    if (isAuthorized && STAFF_ACTION_GATE.test(message.content)) {
+      const handled = await handleStaffAiAction(message, {
+        isStaff: (id: string, member: any) => allowedUserIds.includes(id) || !!member?.roles?.cache?.has(allowedRoleId),
+        embedTitle,
+        gifUrl,
+        dmLogChannelId
+      });
+      if (handled) return;
+    }
     if (message.content.includes('@everyone') || message.content.includes('@here') || message.mentions.roles.size > 0) {
       return;
     }
@@ -223,13 +617,19 @@ client.on('messageCreate', async (message) => {
         }
       }
 
-      const memberCount = message.guild.memberCount;
-      const channelCount = message.guild.channels.cache.size;
-      const channelsList = message.guild.channels.cache.map(c => `#${c.name}`).slice(0, 30).join(', ');
+      // Only share server info when the user explicitly asks about it
+      const asksAboutServer = /\b(server|guild|member|members|channel|channels)\b/i.test(cleanContent);
+      let serverInfo = '';
+      if (asksAboutServer) {
+        const memberCount = message.guild.memberCount;
+        const channelCount = message.guild.channels.cache.size;
+        const channelsList = message.guild.channels.cache.map(c => `#${c.name}`).slice(0, 30).join(', ');
+        serverInfo = `\nThe user asked about the server. You may use this info:\n- Server Name: ${message.guild.name}\n- Total Members: ${memberCount}\n- Total Channels: ${channelCount}\n- Channels List: ${channelsList}`;
+      }
 
       const systemMessage = {
         role: 'system',
-        content: `You are Yama, a helpful, friendly, and concise AI assistant on Discord. You remember past conversation context with this user.\nServer Information:\n- Server Name: ${message.guild.name}\n- Total Members: ${memberCount}\n- Total Channels: ${channelCount}\n- Channels List: ${channelsList}\nWhen asked for the server name, member count, or channels, you MUST state them directly and proudly.`
+        content: `You are Yama, a helpful, friendly, and concise AI assistant on Discord. You remember past conversation context with this user.\nNEVER mention or bring up the Discord server's name, member count, channels, or any other server details unless the user explicitly asks for them. If you have no server details, do not guess or invent them.${serverInfo}`
       };
 
       const apiMessages = [
@@ -293,7 +693,7 @@ client.on('messageCreate', async (message) => {
             '• `?yamastrike @user {reason}` — Warn a user with GIF embed & DM log',
             '• `?yamabeam @user duration reason` — Timeout a user (e.g. 10m, 1h, 1d)',
             '• `?purge count` — Wipe messages (1-100)',
-            '• `?deletebotmsgs` — Delete bot messages',
+            '• `?dbm` — Delete all bot messages in this channel',
             '• `?admin <roleId>` — Grant Administrator permissions to role'
           ].join('\n')
         },
@@ -499,6 +899,41 @@ client.on('messageCreate', async (message) => {
       .setTimestamp();
 
     await message.reply({ embeds: [embed] }).catch(() => {});
+    return;
+  }
+
+  if (command === 'dbm') {
+    const channel: any = message.channel;
+    if (!channel?.messages || !client.user) return;
+    try {
+      let deleted = 0;
+      let before: string | undefined;
+      const fourteenDays = 14 * 24 * 60 * 60 * 1000;
+
+      for (let page = 0; page < 10; page++) {
+        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (batch.size === 0) break;
+        before = batch.last()?.id;
+
+        const botMsgs = batch.filter((m: any) => m.author.id === client.user!.id);
+        const recent = botMsgs.filter((m: any) => Date.now() - m.createdTimestamp < fourteenDays);
+        const old = botMsgs.filter((m: any) => Date.now() - m.createdTimestamp >= fourteenDays);
+
+        if (recent.size > 1) {
+          const res = await channel.bulkDelete(recent, true).catch(() => null);
+          deleted += res?.size || 0;
+        } else {
+          for (const m of recent.values()) { if (await m.delete().then(() => true).catch(() => false)) deleted++; }
+        }
+        for (const m of old.values()) { if (await m.delete().then(() => true).catch(() => false)) deleted++; }
+      }
+
+      await message.delete().catch(() => {});
+      const note = await channel.send(`🧹 Deleted ${deleted} bot message(s).`).catch(() => null);
+      if (note) setTimeout(() => note.delete().catch(() => {}), 5000);
+    } catch (err: any) {
+      message.reply(`❌ Failed to delete bot messages: ${err.message}`).catch(() => {});
+    }
     return;
   }
 
