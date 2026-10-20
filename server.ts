@@ -12,12 +12,20 @@ import { createServer as createViteServer } from 'vite';
 import { Client, GatewayIntentBits, EmbedBuilder, ActivityType, PermissionsBitField, TextChannel } from 'discord.js';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, getDoc, onSnapshot } from 'firebase/firestore';
-import firebaseConfig from './firebase-applet-config.json';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+let firebaseConfig: any = {};
+try {
+  const configPath = resolve(__dirname, 'firebase-applet-config.json');
+  if (fs.existsSync(configPath)) {
+    firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  }
+} catch (e) {
+  console.warn('Failed to load firebase-applet-config.json:', e);
+}
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 let botClient: Client | null = null;
 let botStatus: 'offline' | 'starting' | 'online' | 'error' = 'offline';
