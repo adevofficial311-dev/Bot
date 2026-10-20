@@ -9,6 +9,7 @@ import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, getDoc } fro
 import fs from 'fs';
 import { resolve } from 'path';
 import dotenv from 'dotenv';
+import http from 'http';
 
 dotenv.config();
 
@@ -78,6 +79,16 @@ async function loadAfkUsersFromFirestore() {
   }
 }
 
+
+// Health server so Render detects an open port
+const PORT = Number(process.env.PORT) || 10000;
+http
+  .createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running');
+  })
+  .listen(PORT, '0.0.0.0', () => console.log(`🌐 Health server on port ${PORT}`));
+
 // Bot client setup
 const client = new Client({
   intents: [
@@ -88,7 +99,7 @@ const client = new Client({
   ]
 });
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`🤖 Logged in as ${client.user?.tag}!`);
   await loadAfkUsersFromFirestore();
   if (client.user && botCustomStatus) {
