@@ -89,7 +89,7 @@ const PORT = Number(process.env.PORT) || 10000;
 http
   .createServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running');
+    res.end(client.isReady() ? 'Bot is online' : 'Bot is starting or offline');
   })
   .listen(PORT, '0.0.0.0', () => console.log(`🌐 Health server on port ${PORT}`));
 
@@ -1945,12 +1945,30 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// ── Diagnostics: make silent failures visible in the Render logs ──
+process.on('unhandledRejection', (r: any) => console.error('❗ Unhandled rejection:', r?.message || r));
+process.on('uncaughtException', (e: any) => console.error('❗ Uncaught exception:', e?.stack || e));
+client.on('error', (e: any) => console.error('❗ Client error:', e.message));
+client.on('shardError', (e: any) => console.error('❗ Shard error:', e.message));
+client.on('shardDisconnect', (ev: any) => console.warn('⚠️ Shard disconnected, code:', ev?.code));
+client.on('shardReconnecting', () => console.warn('🔄 Shard reconnecting...'));
+
 // Start bot
 const token = process.env.DISCORD_TOKEN;
 if (token) {
-  client.login(token).catch(err => {
-    console.error('Bot login error:', err.message);
+  console.log('🔑 Logging in to Discord...');
+  client.login(token).then(() => console.log('🔑 Discord accepted the login.')).catch(err => {
+    console.error('❌ Bot login error:', err.message);
+    process.exit(1);
   });
+  // If the bot isn't ready after 90s, restart so the host retries instead of sitting offline
+  setTimeout(() => {
+    if (!client.isReady()) {
+      console.error('❌ Bot still not ready after 90s. Restarting...');
+      process.exit(1);
+    }
+  }, 90000);
 } else {
   console.log('⚠️ DISCORD_TOKEN environment variable not set. Please set it in .env or your hosting platform.');
+  process.exit(1);
 }
